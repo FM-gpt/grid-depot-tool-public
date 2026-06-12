@@ -1,0 +1,21 @@
+# Example client SSH config
+
+Add to `~/.ssh/config` on a client device:
+
+```sshconfig
+Host grid-depot-server
+  HostName depot.example.internal
+  User root
+  IdentityFile ~/.ssh/grid_depot_server
+  IdentitiesOnly yes
+```
+
+For a generalized deployment, use a non-root user once server permissions are split out:
+
+```sshconfig
+Host grid-depot-server
+  HostName depot.example.internal
+  User grid-depot
+  IdentityFile ~/.ssh/grid_depot_server
+  IdentitiesOnly yes
+```

@@ -1,0 +1,400 @@
+#!/usr/bin/env python3
+from __future__ import annotations
+import argparse, datetime as dt, hashlib, json, mimetypes, os, re, shutil, sys, urllib.parse, urllib.request
+from pathlib import Path
+
+ROOT = Path(os.environ.get('GRID_DEPOT_ROOT', '/var/lib/grid-depot')).expanduser()
+MANIFEST = ROOT / 'manifest.json'
+STORE = ROOT / 'store'
+BYTYPE = ROOT / 'by-type'
+INCOMING = ROOT / 'incoming'
+REPORTS = ROOT / 'reports'
+SCAN_DIRS = [
+    Path.home() / 'Downloads',
+    Path.home() / 'Library/Mobile Documents/com~apple~CloudDocs/Downloads',
+    Path.home() / 'Library/Mobile Documents/com~apple~CloudDocs/iCloud Downloads',
+]
+EXT_TYPES = {
+    '.iso': 'iso', '.dmg': 'dmg', '.pkg': 'pkg', '.img': 'disk-image',
+    '.qcow2': 'vm-image', '.vmdk': 'vm-image', '.gguf': 'ai-model', '.safetensors': 'ai-model',
+    '.zip': 'archive', '.tar': 'archive', '.gz': 'archive', '.xz': 'archive', '.zst': 'archive',
+    '.sh': 'script', '.py': 'script', '.json': 'config', '.yml': 'config', '.yaml': 'config', '.toml': 'config',
+}
+
+VERSION_RE = re.compile(r'(?i)(?:^|[-_ .])v?(\d+(?:\.\d+){1,4}(?:[-_.]?(?:alpha|beta|rc|arm64|x64|universal|aarch64|amd64|q\d(?:_[a-z])?))*)')
+NOISE_TOKENS = {
+    'installer', 'install', 'setup', 'latest', 'universal', 'arm64', 'aarch64', 'x64', 'amd64', 'darwin',
+    'mac', 'macos', 'osx', 'signed', 'stable', 'release', 'final', 'instruct', 'q4', 'q5', 'q6', 'q8',
+    'k', 'm', 'gguf', 'dmg', 'pkg', 'iso', 'zip', 'tar', 'gz', 'xz', 'zst',
+}
+
+
+def now() -> str:
+    return dt.datetime.now(dt.timezone.utc).astimezone().isoformat(timespec='seconds')
+
+
+def safe(s: str) -> str:
+    s = ''.join(c if c.isalnum() or c in ' .-_+' else '_' for c in s).strip()
+    return s or 'artifact'
+
+
+def human(n: int) -> str:
+    v = float(n)
+    for u in ['B', 'KiB', 'MiB', 'GiB', 'TiB']:
+        if v < 1024 or u == 'TiB':
+            return f'{int(v)} B' if u == 'B' else f'{v:.1f} {u}'
+        v /= 1024
+    return f'{n} B'
+
+
+def ensure() -> None:
+    for d in [ROOT, STORE, BYTYPE, INCOMING, REPORTS, ROOT / 'bin', ROOT / 'bootstrap']:
+        d.mkdir(parents=True, exist_ok=True)
+    if not MANIFEST.exists():
+        save({'schema': 2, 'created_at': now(), 'artifacts': []})
+
+
+def load() -> dict:
+    ensure()
+    return json.loads(MANIFEST.read_text())
+
+
+def save(m: dict) -> None:
+    MANIFEST.parent.mkdir(parents=True, exist_ok=True)
+    tmp = MANIFEST.with_suffix('.tmp')
+    tmp.write_text(json.dumps(m, indent=2, sort_keys=True) + '\n')
+    tmp.replace(MANIFEST)
+
+
+def sha(path: Path) -> tuple[str, int]:
+    h = hashlib.sha256()
+    size = 0
+    with path.open('rb') as f:
+        for b in iter(lambda: f.read(8 * 1024 * 1024), b''):
+            size += len(b)
+            h.update(b)
+    return h.hexdigest(), size
+
+
+def typ(path: Path, override: str | None = None) -> str:
+    if override:
+        return override
+    n = path.name.lower()
+    if n.endswith(('.tar.gz', '.tgz')):
+        return 'archive'
+    return EXT_TYPES.get(path.suffix.lower(), 'raw')
+
+
+def infer_version(name: str) -> str | None:
+    stem = Path(name).name
+    # Strip double extensions for archives like .tar.gz.
+    for suffix in ['.tar.gz', '.tar.xz', '.tar.zst']:
+        if stem.lower().endswith(suffix):
+            stem = stem[:-len(suffix)]
+    stem = Path(stem).stem
+    m = VERSION_RE.search(stem)
+    if not m:
+        return None
+    return m.group(1).strip('-_. ')
+
+
+def infer_family(name: str) -> str:
+    stem = Path(name).name
+    for suffix in ['.tar.gz', '.tar.xz', '.tar.zst']:
+        if stem.lower().endswith(suffix):
+            stem = stem[:-len(suffix)]
+    stem = Path(stem).stem
+    stem = VERSION_RE.sub(' ', stem)
+    toks = re.split(r'[^A-Za-z0-9]+', stem.lower())
+    toks = [t for t in toks if t and t not in NOISE_TOKENS and not t.isdigit()]
+    return '-'.join(toks[:6]) or Path(name).stem.lower()
+
+
+def dest_for(digest: str, name: str) -> Path:
+    return STORE / digest[:2] / digest / safe(name)
+
+
+def find_by_sha(m: dict, digest: str) -> dict | None:
+    return next((a for a in m.get('artifacts', []) if a.get('sha256') == digest), None)
+
+
+def family_matches(m: dict, family: str, artifact_type: str | None = None) -> list[dict]:
+    rows = [a for a in m.get('artifacts', []) if a.get('family') == family]
+    if artifact_type:
+        rows = [a for a in rows if a.get('type') == artifact_type]
+    return sorted(rows, key=lambda a: (a.get('version') or '', a.get('created_at') or ''))
+
+
+def relink(a: dict) -> None:
+    refdir = BYTYPE / safe(a['type'])
+    refdir.mkdir(parents=True, exist_ok=True)
+    ref = refdir / f"{safe(a['name'])}__{a['sha256'][:12]}"
+    if ref.exists() or ref.is_symlink():
+        ref.unlink()
+    try:
+        ref.symlink_to(Path(a['store_path']))
+    except OSError:
+        shutil.copy2(a['store_path'], ref)
+
+
+def merge_tags(existing: dict, tags: list[str] | None) -> None:
+    for tag in (tags or ['imported']):
+        if tag and tag not in existing.setdefault('tags', []):
+            existing['tags'].append(tag)
+    existing['tags'] = sorted(set(existing.get('tags', [])))
+
+
+def import_one(p: str | Path, atype: str | None = None, tags: list[str] | None = None, source_url: str | None = None, move: bool = False) -> tuple[str, dict, list[dict]]:
+    p = Path(p).expanduser().resolve()
+    if not p.is_file():
+        raise SystemExit(f'Not a file: {p}')
+    digest, size = sha(p)
+    m = load()
+    existing = find_by_sha(m, digest)
+    artifact_type = typ(p, atype)
+    family = infer_family(p.name)
+    version = infer_version(p.name)
+    related = family_matches(m, family, artifact_type)
+    if existing:
+        merge_tags(existing, tags)
+        sp = str(p)
+        if sp not in existing.setdefault('source_paths', []):
+            existing['source_paths'].append(sp)
+        if source_url and source_url not in existing.setdefault('source_urls', []):
+            existing['source_urls'].append(source_url)
+        existing.setdefault('family', infer_family(existing.get('name', p.name)))
+        existing.setdefault('version', infer_version(existing.get('name', p.name)))
+        existing['last_seen_at'] = now()
+        save(m)
+        relink(existing)
+        return 'already-present', existing, related
+    d = dest_for(digest, p.name)
+    d.parent.mkdir(parents=True, exist_ok=True)
+    shutil.move(str(p), str(d)) if move else shutil.copy2(p, d)
+    mime, _ = mimetypes.guess_type(p.name)
+    a = {
+        'id': digest[:16],
+        'name': p.name,
+        'type': artifact_type,
+        'family': family,
+        'version': version,
+        'sha256': digest,
+        'size_bytes': size,
+        'human_size': human(size),
+        'mime_type': mime,
+        'store_path': str(d),
+        'source_paths': ([] if move else [str(p)]),
+        'source_urls': ([source_url] if source_url else []),
+        'tags': sorted(set(tags or ['imported'])),
+        'created_at': now(),
+        'last_seen_at': now(),
+    }
+    m.setdefault('artifacts', []).append(a)
+    save(m)
+    relink(a)
+    return 'imported', a, related
+
+
+def print_import_result(status: str, a: dict, related: list[dict], show_related: bool = True) -> None:
+    print(f"{status}: {a['name']} {a['human_size']} sha256:{a['sha256'][:16]} type:{a['type']} family:{a.get('family') or '-'} version:{a.get('version') or '-'} tags:{','.join(a.get('tags', []))}")
+    if show_related:
+        comparable = [r for r in related if r.get('sha256') != a.get('sha256')]
+        if comparable:
+            print('  related existing artifacts:')
+            for r in comparable[-8:]:
+                print(f"  - {r['id']} {r.get('version') or '-':<16} {r['human_size']:>10} {r['name']} [{','.join(r.get('tags', []))}]")
+
+
+def cmd_import(args) -> int:
+    tags = args.tag or ['imported']
+    for p in args.paths:
+        status, a, related = import_one(p, args.type, tags, args.source_url, args.move)
+        print_import_result(status, a, related, not args.quiet)
+    return 0
+
+
+def cmd_get(args) -> int:
+    url = args.url
+    name = safe(Path(urllib.parse.unquote(urllib.parse.urlparse(url).path)).name or 'download')
+    d = INCOMING / name
+    if not d.exists() or args.force:
+        print(f'downloading: {url}')
+        with urllib.request.urlopen(url) as r, d.open('wb') as f:
+            shutil.copyfileobj(r, f)
+    status, a, related = import_one(d, args.type, args.tag or ['downloaded'], url, False)
+    print_import_result(status, a, related)
+    return 0
+
+
+def cmd_list(args) -> int:
+    arts = load().get('artifacts', [])
+    if args.type:
+        arts = [a for a in arts if a.get('type') == args.type]
+    if args.tag:
+        arts = [a for a in arts if args.tag in a.get('tags', [])]
+    if args.family:
+        arts = [a for a in arts if a.get('family') == args.family]
+    arts = sorted(arts, key=lambda a: (a.get('type', ''), a.get('family') or '', a.get('version') or '', a.get('name', '')))
+    if args.json:
+        print(json.dumps(arts, indent=2, sort_keys=True))
+        return 0
+    print(f'GRID depot: {ROOT}\nArtifacts: {len(arts)}')
+    for a in arts:
+        version = a.get('version') or '-'
+        family = a.get('family') or '-'
+        print(f"{a['id']}  {a['type']:<10} {a['human_size']:>10}  {a['name']}  family:{family} version:{version} [{','.join(a.get('tags', []))}]")
+    return 0
+
+
+def candidates(dirs: list[str | Path], exts: list[str]) -> list[Path]:
+    wanted = {e.lower() if e.startswith('.') else '.' + e.lower() for e in exts}
+    out = []
+    for root in dirs:
+        root = Path(root).expanduser()
+        if not root.exists():
+            continue
+        for dp, dn, fn in os.walk(root):
+            dn[:] = [d for d in dn if d not in {'node_modules', '.git'} and not d.endswith('.app')]
+            for f in fn:
+                lf = f.lower()
+                if any(lf.endswith(e) for e in wanted):
+                    out.append(Path(dp) / f)
+    return sorted(set(out))
+
+
+def cmd_audit(args) -> int:
+    m = load()
+    known_paths = {p for a in m.get('artifacts', []) for p in a.get('source_paths', [])}
+    known_sha = {a.get('sha256') for a in m.get('artifacts', [])}
+    dirs = [Path(x) for x in (args.dir or SCAN_DIRS)]
+    exts = args.ext or ['iso', 'dmg', 'pkg', 'img', 'qcow2', 'vmdk', 'gguf', 'safetensors']
+    rows = []
+    for p in candidates(dirs, exts):
+        st = 'known-path' if str(p.resolve()) in known_paths else 'unknown'
+        dg = None
+        size = p.stat().st_size
+        if st == 'unknown' and args.hash:
+            dg, _ = sha(p)
+            st = 'known-sha' if dg in known_sha else 'unknown'
+        fam = infer_family(p.name)
+        ver = infer_version(p.name)
+        related = family_matches(m, fam, typ(p, None))
+        rows.append({'path': str(p), 'human_size': human(size), 'size_bytes': size, 'status': st, 'sha256': dg, 'family': fam, 'version': ver, 'related_count': len(related)})
+    report = {'created_at': now(), 'scan_dirs': [str(d) for d in dirs], 'candidates': rows}
+    rp = REPORTS / f"audit-{dt.datetime.now().strftime('%Y%m%d-%H%M%S')}.json"
+    rp.write_text(json.dumps(report, indent=2, sort_keys=True) + '\n')
+    unk = [r for r in rows if r['status'] == 'unknown']
+    print(f'audit report: {rp}\ncandidates: {len(rows)} unknown: {len(unk)}')
+    for r in unk[:args.limit]:
+        rel = f" related:{r['related_count']}" if r.get('related_count') else ''
+        print(f"UNKNOWN {r['human_size']:>10} family:{r.get('family') or '-'} version:{r.get('version') or '-'}{rel} {r['path']}")
+    return 2 if unk else 0
+
+
+def cmd_auto_add(args) -> int:
+    dirs = args.dir or [str(p) for p in SCAN_DIRS]
+    exts = args.ext or ['iso', 'dmg', 'pkg', 'img', 'qcow2', 'vmdk', 'gguf', 'safetensors']
+    paths = [str(p) for p in candidates(dirs, exts)]
+    if args.path:
+        paths.extend(args.path)
+    if not paths:
+        print('No candidate files found.')
+        return 0
+    rc = 0
+    for p in sorted(set(paths)):
+        atype = args.type or typ(Path(p), None)
+        status, a, related = import_one(p, atype, args.tag or ['auto-imported'], None, args.move)
+        print_import_result(status, a, related)
+        if status == 'already-present':
+            rc = max(rc, 0)
+    return rc
+
+
+def cmd_families(args) -> int:
+    arts = load().get('artifacts', [])
+    groups: dict[str, list[dict]] = {}
+    for a in arts:
+        groups.setdefault(a.get('family') or infer_family(a.get('name', 'artifact')), []).append(a)
+    rows = sorted(groups.items(), key=lambda kv: kv[0])
+    if args.json:
+        print(json.dumps({k: v for k, v in rows}, indent=2, sort_keys=True))
+        return 0
+    for fam, items in rows:
+        if args.multiple and len(items) < 2:
+            continue
+        print(f'{fam}: {len(items)}')
+        for a in sorted(items, key=lambda x: (x.get('version') or '', x.get('name') or '')):
+            print(f"  {a['id']} {a.get('version') or '-':<16} {a['type']:<10} {a['human_size']:>10} {a['name']} [{','.join(a.get('tags', []))}]")
+    return 0
+
+
+def cmd_where(args) -> int:
+    print(ROOT)
+    return 0
+
+
+def build_parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(
+        prog='grid-depot',
+        description='Server artifact depot. Stores installers, ISOs, packages, scripts, disk images, and curated model files under the configured GRID_DEPOT_ROOT.',
+    )
+    sub = p.add_subparsers(dest='cmd', required=True)
+
+    s = sub.add_parser('import', aliases=['add'], help='Import one or more files already present on the server.')
+    s.add_argument('paths', nargs='+', help='Server-local files to import.')
+    s.add_argument('--type', help='Artifact type, e.g. iso, dmg, pkg, ai-model. Defaults from extension.')
+    s.add_argument('--tag', action='append', help='Tag to apply. Can be repeated. Default: imported.')
+    s.add_argument('--source-url', help='Original source URL to record.')
+    s.add_argument('--move', action='store_true', help='Move file into the depot instead of copying it.')
+    s.add_argument('--quiet', action='store_true', help='Do not print related-version hints.')
+    s.set_defaults(func=cmd_import)
+
+    s = sub.add_parser('get', help='Download a URL on the server and import it into the depot.')
+    s.add_argument('url', help='URL to download.')
+    s.add_argument('--type', help='Artifact type override.')
+    s.add_argument('--tag', action='append', help='Tag to apply. Can be repeated. Default: downloaded.')
+    s.add_argument('--force', action='store_true', help='Re-download even when incoming file already exists.')
+    s.set_defaults(func=cmd_get)
+
+    s = sub.add_parser('list', help='List artifacts.')
+    s.add_argument('--type', help='Filter by artifact type.')
+    s.add_argument('--tag', help='Filter by tag.')
+    s.add_argument('--family', help='Filter by inferred family/app/model name.')
+    s.add_argument('--json', action='store_true', help='Output raw JSON.')
+    s.set_defaults(func=cmd_list)
+
+    s = sub.add_parser('audit', help='Scan server-side directories for candidate artifact files.')
+    s.add_argument('--dir', action='append', help='Directory to scan. Can be repeated. Default: server user Downloads/iCloud Downloads.')
+    s.add_argument('--ext', action='append', help='Extension to include, e.g. dmg or iso. Can be repeated.')
+    s.add_argument('--hash', action='store_true', help='Hash unknown files to detect duplicate content. Slower.')
+    s.add_argument('--limit', type=int, default=50, help='Maximum unknown rows to print. Default: 50.')
+    s.set_defaults(func=cmd_audit)
+
+    s = sub.add_parser('auto-add', aliases=['auto-import'], help='Server-side scan/import of candidate files with duplicate and related-version reporting.')
+    s.add_argument('path', nargs='*', help='Optional explicit server-local files to import in addition to scan results.')
+    s.add_argument('--dir', action='append', help='Server-side directory to scan. Can be repeated.')
+    s.add_argument('--ext', action='append', help='Extension to include. Can be repeated.')
+    s.add_argument('--type', help='Type override for explicit paths.')
+    s.add_argument('--tag', action='append', help='Tag to apply. Default: auto-imported.')
+    s.add_argument('--move', action='store_true', help='Move instead of copy for server-local files.')
+    s.set_defaults(func=cmd_auto_add)
+
+    s = sub.add_parser('families', help='Show inferred artifact families and versions for duplicate/version review.')
+    s.add_argument('--multiple', action='store_true', help='Only show families with more than one artifact.')
+    s.add_argument('--json', action='store_true', help='Output raw JSON grouped by family.')
+    s.set_defaults(func=cmd_families)
+
+    s = sub.add_parser('where', help='Print the active depot root.')
+    s.set_defaults(func=cmd_where)
+    return p
+
+
+def main() -> None:
+    ensure()
+    parser = build_parser()
+    args = parser.parse_args()
+    raise SystemExit(args.func(args))
+
+
+if __name__ == '__main__':
+    main()

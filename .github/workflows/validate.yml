@@ -1,0 +1,25 @@
+name: validate
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.x'
+      - name: Python syntax checks
+        run: |
+          python -m py_compile bin/grid-depot client/grid-depot-client.py
+      - name: Shell syntax checks
+        run: |
+          sh -n bootstrap/macbook-grid-depot-client.sh
+          sh -n bootstrap/macbook-grid-dns-setup.sh
+      - name: Help smoke checks
+        run: |
+          GRID_DEPOT_ROOT="$(mktemp -d)" python bin/grid-depot --help
+          GRID_DEPOT_ROOT="$(mktemp -d)" python bin/grid-depot list
