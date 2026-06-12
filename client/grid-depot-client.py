@@ -17,7 +17,12 @@ NOISE = {'installer','install','setup','latest','universal','arm64','aarch64','x
 VERSION_RE = re.compile(r'(?i)(?:^|[-_ .])v?(\d+(?:\.\d+){1,4}(?:[-_.]?(?:alpha|beta|rc|arm64|x64|universal|aarch64|amd64|q\d(?:_[a-z])?))*)')
 
 def run_remote(args, check=True, capture=False):
-    cmd = SSH_BASE + ['/usr/local/bin/grid-depot'] + args
+    # OpenSSH sends the remote command through the user's shell. If we pass
+    # individual argv items after the host, paths with spaces are split by the
+    # remote shell (for example: "Antigravity IDE.dmg"). Quote every remote
+    # command argument explicitly before handing it to ssh.
+    remote_cmd = ' '.join(shlex.quote(x) for x in ['/usr/local/bin/grid-depot'] + list(args))
+    cmd = SSH_BASE + [remote_cmd]
     return subprocess.run(cmd, check=check, text=True, capture_output=capture)
 
 def human(n):

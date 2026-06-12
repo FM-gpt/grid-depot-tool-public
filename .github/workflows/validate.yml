@@ -19,6 +19,9 @@ jobs:
         run: |
           sh -n bootstrap/macbook-grid-depot-client.sh
           sh -n bootstrap/macbook-grid-dns-setup.sh
+      - name: Unit tests
+        run: |
+          python -m unittest discover -s tests -v
       - name: Help smoke checks
         run: |
           GRID_DEPOT_ROOT="$(mktemp -d)" python bin/grid-depot --help
