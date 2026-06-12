@@ -33,6 +33,9 @@ This project started as the GRID local artifact depot pilot. The next goal is to
 - license field
 - checksum-source field
 - architecture/platform tags
+- searchable tool categories, such as `installer`, `developer-tool`, `server-image`, `ai-model`, `firmware`, `utility`, `backup-tool`, `network-tool`
+- short human descriptions for each artifact so the depot can answer "what is this for?"
+- search tags/keywords for later database search, filtering, and dashboard discovery
 - artifact status: `candidate`, `current`, `previous`, `keep`, `retired`
 - machine-readable sidecar metadata
 
@@ -69,7 +72,10 @@ This project started as the GRID local artifact depot pilot. The next goal is to
 
 ### Web UI
 
+- basic web dashboard as a near-term product milestone
 - read-only artifact browser
+- searchable/filterable table by name, type, category, tags, platform, size, status, and date added
+- artifact detail page showing short description, source URL, checksum, tags, related versions, and install/retrieval notes
 - upload workflow with duplicate warnings
 - version-family view
 - disk usage dashboard
