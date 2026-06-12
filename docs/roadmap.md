@@ -81,6 +81,14 @@ This project started as the GRID local artifact depot pilot. The next goal is to
 - disk usage dashboard
 - retention review queue
 
+### CLI progress and run summaries
+
+- end-of-run summary table showing files scanned, new imports, duplicates skipped, failures, local files removed, total bytes uploaded, total bytes avoided via duplicate detection, and total run time
+- per-type/category breakdown in the summary, for example ISO, DMG, PKG, disk image, AI model
+- optional machine-readable JSON run report for later dashboards and logs
+- live progress box for long runs with current file, item counter, uploaded bytes, transfer rate, elapsed time, ETA, and success/failure counters
+- progress bar/status line that updates without requiring a web UI, with a plain-output fallback for cron/log mode
+
 ### API
 
 - local HTTP API behind LAN/VPN only
